@@ -1,4 +1,6 @@
 #include <String.h>
+#include <ESP8266WiFi.h>
+#include <PubSubClient.h>
 
 #define   BAUD_RATE   115200
 #define   RX_PIN      13      // Connected to P0_3 CC2530 TX_PIN
@@ -16,16 +18,18 @@ void ZNP_ZDO_STARTUP_FROM_APP(void);
 void serialMonitorPacket(String log, uint8_t *pMsg, uint8_t len);
 void serialMonitorString(String log);
 void serialSwap(unsigned long ms);
+void connectToMQTTBroker(void);
+void connectToWiFi(void);
 
 uint8_t incomingByte = 0;
-uint8_t receivedPackets[255];
+uint8_t receivedPackets[128];
 uint8_t packetIndex = 0;
 uint8_t max_len = 255;
 
 uint8_t coord_short_add[2];
 uint8_t coord_IEEE_add[8];
 
-uint8_t *connectedDev;
+uint8_t* connectedDev;
 
 uint8_t flag = 1;
 uint8_t flag_req = 0;
@@ -36,7 +40,25 @@ uint8_t flag_setup = 0;
 uint8_t flag_coord = 0;
 uint8_t flag_disply_attemp = 1;
 
-unsigned long previousMillis;
+// WiFi settings
+const char *ssid = "Erfan's Galaxy S22 Ultra";             // Replace with your WiFi name
+const char *password = "gzpm2331";   // Replace with your WiFi password
+
+// MQTT Broker settings
+const char *mqtt_broker = "broker.emqx.io";   // EMQX broker endpoint
+const char *mqtt_topic = "emqx/esp8266";      // MQTT topic
+const char *mqtt_username = "emqx";           // MQTT username for authentication
+const char *mqtt_password = "public";         // MQTT password for authentication
+const int mqtt_port = 1883;                   // MQTT port (TCP)
+
+const char *zigbee_switch_topic = "cc2530/switch";
+uint8_t switch_state = 1;
+
+unsigned long prevMillis;
+char switch_state_str[4]; // Buffer to hold the string representation
+
+WiFiClient espClient;
+PubSubClient mqtt_client(espClient);
 
 void setup() 
 {
@@ -49,6 +71,12 @@ void setup()
   Serial.begin(BAUD_RATE);
   while (!Serial);  // Wait for Serial to initialize
 
+  connectToWiFi();
+  mqtt_client.setServer(mqtt_broker, mqtt_port);
+  connectToMQTTBroker();
+
+  delay(10000);
+
   serialSwap(10);
 
   // CC2530 Power Up Procedure
@@ -57,7 +85,7 @@ void setup()
   digitalWrite(CC2530_CT_PIN, LOW);
   delay(1000);
   digitalWrite(CC2530_RESET_PIN, HIGH);
-  delay(5000);
+  delay(1000);
 
   while(1)
   {
@@ -127,9 +155,10 @@ void setup()
               coord_short_add[i] = receivedPackets[i + 13];
             }
             serialMonitorPacket("UTIL_GET_DEVICE_INFO: ", receivedPackets, packetIndex);
-            serialMonitorPacket("COORD_IEEE_ADD:  ", coord_IEEE_add, 8);
-            serialMonitorPacket("COORD_SHORT_ADD: ", coord_short_add, 2);
+            // serialMonitorPacket("COORD_IEEE_ADD:  ", coord_IEEE_add, 8);
+            // serialMonitorPacket("COORD_SHORT_ADD: ", coord_short_add, 2);
 
+            delay(1000);
             break;
           }
         }
@@ -157,10 +186,17 @@ void setup()
   digitalWrite(CC2530_CT_PIN, LOW);
   packetIndex = 0;
   max_len = 255;
+
+  prevMillis = millis();
 }
 
 void loop()
 {
+  if (!mqtt_client.connected()) {
+    connectToMQTTBroker();
+  }
+  mqtt_client.loop();
+
   if(Serial.available())
   {
     digitalWrite(CC2530_CT_PIN, HIGH);
@@ -197,16 +233,15 @@ void loop()
     {
       flag_act = 1;
     }
-    serialSwap(10);
-
-    Serial.println();
-    for(int i=0; i<packetIndex; i++)
+    else if(receivedPackets[2] == 0x44 && receivedPackets[3] == 0x81) // AF_INCOMING_MSG
     {
-      Serial.print(receivedPackets[i], HEX);
-      Serial.print(" ");
+      switch_state = receivedPackets[27];
+      
+      itoa(switch_state, switch_state_str, 10); // Convert integer to string
+      mqtt_client.publish(zigbee_switch_topic, switch_state_str);
     }
-    
-    serialSwap(10);
+
+    serialMonitorPacket(" ", receivedPackets, packetIndex);
 
     digitalWrite(CC2530_CT_PIN, LOW);
     packetIndex = 0;
@@ -216,20 +251,20 @@ void loop()
   if(flag_req)
   {
     flag_req = 0;
-    uint8_t general4[] = {0x05, 0x25, 0x04, connectedDev[4], connectedDev[5], connectedDev[6], connectedDev[7], 0xFF}; // ZB_PERMIT_JOINING_REQUEST
+    uint8_t general4[] = {0x05, 0x25, 0x04, connectedDev[4], connectedDev[5], connectedDev[6], connectedDev[7], 0xFF}; // ZDO_SIMPLE_DESC_REQ 
     sendTxPacket(general4); // SRSP: 0x01 0x66 0x08 STATUS
   }
   if(flag_act)
   {
     flag_act = 0;
     flag_seq = 1;
-    uint8_t general5[] = {0x04, 0x25, 0x05, connectedDev[4], connectedDev[5], connectedDev[6], connectedDev[7]}; // ZB_PERMIT_JOINING_REQUEST
+    uint8_t general5[] = {0x04, 0x25, 0x05, connectedDev[4], connectedDev[5], connectedDev[6], connectedDev[7]}; // ZDO_ACTIVE_EP_REQ 
     sendTxPacket(general5); // SRSP: 0x01 0x66 0x08 STATUS
   }
   if(flag_seq)
   {
     flag_seq = 0;
-    uint8_t general6[] = {0x09, 0x24, 0x00, 0x01, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}; // ZB_PERMIT_JOINING_REQUEST
+    uint8_t general6[] = {0x09, 0x24, 0x00, 0x01, 0x04, 0x01, coord_short_add[0], coord_short_add[1], 0x00, 0x00, 0x00, 0x00}; // AF_REGISTER 
     sendTxPacket(general6); // SRSP: 0x01 0x66 0x08 STATUS
   }
   if(flag)
@@ -237,6 +272,11 @@ void loop()
     flag = 0;
     uint8_t general3[] = {0x03, 0x26, 0x08, 0xFC, 0xFF, 0xFF}; // ZB_PERMIT_JOINING_REQUEST
     sendTxPacket(general3); // SRSP: 0x01 0x66 0x08 STATUS
+  }
+  if(millis()-prevMillis >= 10000)
+  {
+    prevMillis = millis();
+    mqtt_client.publish(mqtt_topic, "heartbeat");
   }
 }
 
@@ -308,4 +348,38 @@ void serialSwap(unsigned long ms)
   Serial.flush();
   Serial.swap();
   delay(ms);
+}
+
+void connectToWiFi(void) 
+{
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+      delay(500);
+      Serial.print(".");
+  }
+  Serial.println("\nConnected to the WiFi network");
+}
+
+void connectToMQTTBroker(void) 
+{
+  while (!mqtt_client.connected()) 
+  {
+    String client_id = "esp8266-client-" + String(WiFi.macAddress());
+    Serial.printf("Connecting to MQTT Broker as %s.....\n", client_id.c_str());
+    if (mqtt_client.connect(client_id.c_str(), mqtt_username, mqtt_password)) 
+    {
+      Serial.println("Connected to MQTT broker");
+      // mqtt_client.subscribe(mqtt_topic);
+      // Publish message upon successful connection
+      mqtt_client.publish(mqtt_topic, "Hi EMQX I'm ESP8266 ^^");
+    } 
+    else 
+    {
+      Serial.print("Failed to connect to MQTT broker, rc=");
+      Serial.print(mqtt_client.state());
+      Serial.println(" try again in 5 seconds");
+      delay(5000);
+    }
+  }
 }
